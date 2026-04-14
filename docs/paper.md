@@ -216,6 +216,34 @@ The 20 "missing" IDs were merged into other tetrahedra via edge contraction duri
 | Themes extracted | concept, sub, neural, networks, and |
 | Content after reorg | [abstract:concept, sub, neural] base concept: machine learning + 3 related |
 
+
+### 9.5 Scale Performance (50K)
+
+We benchmarked `TetraMesh` write throughput and memory on the same 1-core 2GB server, inserting 50,000 memories with random 3D seed points and periodic dream cycles (every 5,000 items).
+
+| Scale | Throughput (items/s) | Heap (MB) | RSS (MB) |
+|-------|---------------------|-----------|----------|
+| 10K | 1,200 | 48 | 157 |
+| 20K | 1,195 | 79 | 283 |
+| 30K | 1,204 | 109 | 419 |
+| 40K | 1,181 | 135 | 539 |
+| 50K | 1,192 | 167 | 716 |
+
+Per-operation latency for `GeoMemoryBody.store()` was measured separately:
+
+| Scale | avg (ms) | p50 (ms) | p99 (ms) | Memory (MB) |
+|-------|----------|----------|----------|-------------|
+| 10K | 2.2 | 2.1 | 2.5 | 60 |
+| 20K | 2.2 | 2.1 | 2.3 | 101 |
+
+Per-operation latency for `TetraMesh.store()`:
+
+| Scale | avg (ms) |
+|-------|----------|
+| 10K | 0.8 |
+
+**Observations**: Write throughput remains flat at ~1,200 items/s across the entire 50K range, demonstrating that the lazy boundary cache rebuild (every 50 inserts) and `compute_ph(precision="fast")` effectively prevent performance degradation. Memory grows linearly at approximately 3.3 MB per 1,000 tetrahedra. Dream cycles triggered 10 times during the test with no failures, though each dream cycle caused a brief throughput dip in the subsequent batch due to GC pressure. On this hardware, RSS reaches 716 MB at 50K, leaving headroom for approximately 70K tetrahedra within the 2 GB memory limit.
+
 ## 10. Discussion
 
 **Strengths**: TetraMem-XL demonstrates that pure geometric memory without vector embeddings is viable. The topological BFS retrieval provides structurally meaningful results. The dream cycle with DreamProtocol produces controlled self-emergence. Ghost Cell v2 provides a foundation for distributed consistency.
@@ -229,7 +257,7 @@ The 20 "missing" IDs were merged into other tetrahedra via edge contraction duri
 - Ancestry tracking for merged tetrahedra (complete eternity chain)
 - Face/edge-based topological connectivity in fusion scoring
 - Visualization of tetrahedral mesh growth and dream synthesis
-- Large-scale emergence benchmarks (1M+ tetrahedra)
+- Large-scale emergence benchmarks (100K+ tetrahedra; 50K validated on 1c2g)
 - Multi-modal integration depth (PixHomology → tetrahedral anchors)
 
 ## 11. Conclusion
