@@ -8,6 +8,7 @@ All operations use pure geometry primitives. No vector embeddings.
 """
 
 import hashlib
+import re
 import threading
 import time
 from collections import defaultdict
@@ -40,6 +41,7 @@ class MemoryTetrahedron:
         "_spatial_alpha",
         "integration_count",
         "access_count",
+        "secondary_memories",
     )
 
     id: str
@@ -85,6 +87,7 @@ class MemoryTetrahedron:
         self._spatial_alpha = _spatial_alpha
         self.integration_count = integration_count
         self.access_count = access_count
+        self.secondary_memories: List[Dict[str, Any]] = []
 
     def filtration(self, time_lambda: float = 0.001) -> float:
         age = time.time() - self.creation_time
@@ -98,6 +101,83 @@ class MemoryTetrahedron:
     def touch(self) -> None:
         self.last_access_time = time.time()
         self.access_count += 1
+
+    def attach_secondary(self, content: str, labels: Optional[List[str]] = None,
+                         weight: float = 1.0, metadata: Optional[Dict[str, Any]] = None) -> int:
+        slot = {
+            "content": content,
+            "labels": labels or [],
+            "weight": weight,
+            "metadata": metadata or {},
+            "timestamp": time.time(),
+        }
+        self.secondary_memories.append(slot)
+        return len(self.secondary_memories) - 1
+
+    def integrate_secondary(self) -> int:
+        if not self.secondary_memories:
+            return 0
+
+        n = len(self.secondary_memories)
+        all_contents = [self.content] + [s["content"] for s in self.secondary_memories]
+
+        word_freq = {}
+        for content in all_contents:
+            words = re.findall(r"\b\w{3,}\b", content.lower())
+            for w in words:
+                word_freq[w] = word_freq.get(w, 0) + 1
+
+        theme_words = sorted(word_freq.items(), key=lambda x: -x[1])
+        top_themes = [w for w, c in theme_words[:5] if c >= 2]
+
+        if top_themes and n >= 2:
+            primary_snippet = self.content[:60]
+            secondary_snippets = []
+            for s in sorted(self.secondary_memories, key=lambda x: -x["weight"])[:3]:
+                secondary_snippets.append(s["content"][:60])
+
+            if len(primary_snippet) > 20 and secondary_snippets:
+                theme_str = ", ".join(top_themes[:3])
+                self.content = (
+                    "[abstract:" + theme_str + "] "
+                    + primary_snippet
+                    + " + " + str(len(secondary_snippets)) + " related"
+                )
+
+        label_freq = {}
+        for lbl in self.labels:
+            label_freq[lbl] = label_freq.get(lbl, 0) + 2
+        for s in self.secondary_memories:
+            for lbl in s.get("labels", []):
+                label_freq[lbl] = label_freq.get(lbl, 0) + 1
+
+        consolidated_labels = [lbl for lbl, cnt in sorted(label_freq.items(), key=lambda x: -x[1])
+                               if lbl not in ("__dream__", "__system__")]
+        consolidated_labels = consolidated_labels[:10]
+        self.labels = consolidated_labels
+
+        total_w = self.weight
+        for s in self.secondary_memories:
+            total_w += s.get("weight", 1.0)
+
+        fused = total_w / (1 + n)
+        integration_boost = 1.0 + 0.1 * min(n, 5)
+        self.weight = min(10.0, fused * integration_boost)
+
+        provenance = {
+            "reorg_timestamp": time.time(),
+            "sources_count": n,
+            "source_contents": [s["content"][:80] for s in self.secondary_memories[:5]],
+            "source_labels": [s.get("labels", []) for s in self.secondary_memories[:5]],
+            "themes_extracted": top_themes[:5],
+        }
+        existing = self.metadata.get("reorg_history", [])
+        existing.append(provenance)
+        self.metadata["reorg_history"] = existing[-3:]
+
+        self.catalyze_integration(1.0)
+        self.secondary_memories.clear()
+        return n
 
 
 @dataclass
@@ -132,6 +212,7 @@ class TetraMesh:
         self._centroid_ids: List[str] = []
         self._centroid_matrix: Optional[np.ndarray] = None
         self._boundary_dirty = True
+        self._inserts_since_boundary_rebuild: int = 0
         self._boundary_face_keys: List[Tuple[int, int, int]] = []
         self._boundary_centroids: List[np.ndarray] = []
         self._last_tetra_id: Optional[str] = None
@@ -194,12 +275,25 @@ class TetraMesh:
 
             self._last_tetra_id = tetra_id
             self._centroid_index_dirty = True
-            self._boundary_dirty = True
+            self._inserts_since_boundary_rebuild += 1
+            if self._inserts_since_boundary_rebuild >= 50:
+                self._boundary_dirty = True
+                self._inserts_since_boundary_rebuild = 0
             self._query_cache_dirty = True
             return tetra_id
 
-    def query_topological(self, query_point: np.ndarray, k: int = 5) -> List[Tuple[str, float]]:
-        cache_key = f"{query_point.tobytes().hex()}_{k}"
+    def query_topological(self, query_point: np.ndarray, k: int = 5,
+                          labels: Optional[List[str]] = None) -> List[Tuple[str, float]]:
+        """Pure topological query — seeds by structure, navigates by topology.
+
+        No Euclidean distance used for ranking. Scores come from:
+          - Connection type (face > edge > vertex)
+          - Volume similarity (pure geometry)
+          - Weight similarity
+          - Label overlap (Jaccard)
+          - Time score (freshness)
+        """
+        cache_key = f"{query_point.tobytes().hex()}_{k}_{tuple(labels or [])}"
         if not self._query_cache_dirty and cache_key in self._query_cache:
             return self._query_cache[cache_key]
 
@@ -207,44 +301,48 @@ class TetraMesh:
             if not self._tetrahedra:
                 return []
 
-            seed_id, seed_dist = self._nearest_tetrahedron(query_point)
+            seed_id = self.seed_by_structure(labels)
             if seed_id is None:
                 return []
 
             self._tetrahedra[seed_id].touch()
 
-            visited = {seed_id}
-            results = [(seed_id, self._time_score(seed_id, seed_dist, 0.3))]
+            nav = self.navigate_topology(seed_id, max_steps=k * 3)
 
-            face_nb = self._face_neighbors(seed_id)
-            for nid in face_nb:
-                if nid not in visited and nid in self._tetrahedra:
-                    dist = np.linalg.norm(query_point - self._tetrahedra[nid].centroid)
-                    results.append((nid, self._time_score(nid, dist, 0.4)))
-                    self._tetrahedra[nid].touch()
-                    visited.add(nid)
+            type_penalty = {"seed": 0.1, "face": 0.3, "edge": 0.6, "vertex": 0.85}
+            results = []
+            seen = set()
+            for tid, conn_type, hop in nav:
+                if tid in seen:
+                    continue
+                seen.add(tid)
 
-            edge_nb = self._edge_neighbors(seed_id)
-            for nid in edge_nb - visited:
-                if nid in self._tetrahedra:
-                    dist = np.linalg.norm(query_point - self._tetrahedra[nid].centroid)
-                    results.append((nid, self._time_score(nid, dist, 0.65)))
-                    visited.add(nid)
+                tetra = self._tetrahedra[tid]
+                penalty = type_penalty.get(conn_type, 0.9) + hop * 0.05
 
-            for nid in self._vertex_neighbors(seed_id, face_nb=face_nb, edge_nb=edge_nb) - visited:
-                if nid in self._tetrahedra:
-                    dist = np.linalg.norm(query_point - self._tetrahedra[nid].centroid)
-                    results.append((nid, self._time_score(nid, dist, 0.85)))
-                    visited.add(nid)
+                v_score = 0.0
+                seed_t = self._tetrahedra[seed_id]
+                v1 = self._tetra_volume(seed_t)
+                v2 = self._tetra_volume(tetra)
+                if v1 > 0 and v2 > 0:
+                    v_score = 0.2 * min(v1, v2) / max(v1, v2)
 
-            if len(results) < k:
-                for tid, tetra in self._tetrahedra.items():
-                    if tid not in visited:
-                        dist = np.linalg.norm(query_point - tetra.centroid)
-                        results.append((tid, self._time_score(tid, dist, 1.0)))
-                        visited.add(tid)
-                        if len(results) >= k * 3:
-                            break
+                w_score = 0.15 * (1.0 - abs(seed_t.weight - tetra.weight) / max(seed_t.weight, tetra.weight, 0.1))
+
+                l_score = 0.0
+                if seed_t.labels and tetra.labels:
+                    l_score = 0.15 * len(set(seed_t.labels) & set(tetra.labels)) / len(set(seed_t.labels) | set(tetra.labels))
+
+                fil = tetra.filtration(self._time_lambda)
+                t_score = 0.2 * 1.0 / (1.0 + fil * 0.5)
+                w_factor = tetra.weight / (tetra.init_weight + 1e-6)
+                t_score *= w_factor
+
+                total_score = penalty + v_score + w_score + l_score + t_score
+                results.append((tid, total_score))
+
+                if len(results) >= k * 2:
+                    break
 
             results.sort(key=lambda x: x[1])
             final = results[:k]
@@ -293,6 +391,129 @@ class TetraMesh:
 
             results.sort(key=lambda x: x[1], reverse=True)
             return results
+
+    def store_secondary(self, tetra_id: str, content: str,
+                         labels: Optional[List[str]] = None,
+                         weight: float = 1.0,
+                         metadata: Optional[Dict[str, Any]] = None) -> Optional[int]:
+        """Attach a secondary memory to an existing tetrahedron.
+
+        The memory lives on the same 3-simplex, increasing its density.
+        Call integrate_secondary() later to merge accumulated memories.
+        """
+        with self._lock:
+            tetra = self._tetrahedra.get(tetra_id)
+            if tetra is None:
+                return None
+            slot_idx = tetra.attach_secondary(content, labels, weight, metadata)
+            if labels:
+                for label in labels:
+                    self._label_index[label].add(tetra_id)
+            self._query_cache_dirty = True
+            return slot_idx
+
+    def integrate_tetra(self, tetra_id: str) -> int:
+        """Integrate all secondary memories on a tetrahedron into its primary."""
+        with self._lock:
+            tetra = self._tetrahedra.get(tetra_id)
+            if tetra is None:
+                return 0
+            count = tetra.integrate_secondary()
+            if count > 0:
+                self._centroid_index_dirty = True
+                self._query_cache_dirty = True
+            return count
+
+
+    def abstract_reorganize(self, min_density: int = 2, max_operations: int = 20,
+                            fusion_fn: Optional[Any] = None) -> Dict[str, Any]:
+        stats = {
+            "integrated_count": 0,
+            "cross_fusions": 0,
+            "tetra_scanned": 0,
+            "themes_created": [],
+        }
+
+        with self._lock:
+            dense_tetras = []
+            for tid, tetra in self._tetrahedra.items():
+                n_sec = len(tetra.secondary_memories) if tetra.secondary_memories else 0
+                if n_sec >= min_density:
+                    dense_tetras.append((tid, n_sec))
+                stats["tetra_scanned"] += 1
+
+            dense_tetras.sort(key=lambda x: -x[1])
+
+            ops = 0
+            for tid, density in dense_tetras:
+                if ops >= max_operations:
+                    break
+                tetra = self._tetrahedra.get(tid)
+                if tetra is None or not tetra.secondary_memories:
+                    continue
+                count = tetra.integrate_secondary()
+                if count > 0:
+                    stats["integrated_count"] += 1
+                    ops += 1
+
+            if len(dense_tetras) >= 2 and ops < max_operations:
+                cross_pairs = []
+                for i in range(min(len(dense_tetras), 10)):
+                    for j in range(i + 1, min(len(dense_tetras), 10)):
+                        t1_id = dense_tetras[i][0]
+                        t2_id = dense_tetras[j][0]
+                        t1_t = self._tetrahedra.get(t1_id)
+                        t2_t = self._tetrahedra.get(t2_id)
+                        if t1_t is None or t2_t is None:
+                            continue
+                        shared = self._face_neighbors(t1_id) & self._face_neighbors(t2_id)
+                        edge_overlap = len(
+                            set(t1_t.labels) &
+                            set(t2_t.labels)
+                        )
+                        if len(shared) > 0 or edge_overlap >= 2:
+                            cross_pairs.append((t1_id, t2_id, len(shared) + edge_overlap))
+
+                cross_pairs.sort(key=lambda x: -x[2])
+
+                for t1_id, t2_id, score in cross_pairs:
+                    if ops >= max_operations:
+                        break
+                    t1 = self._tetrahedra.get(t1_id)
+                    t2 = self._tetrahedra.get(t2_id)
+                    if t1 is None or t2 is None:
+                        continue
+
+                    if fusion_fn is not None:
+                        fused_content = fusion_fn(t1.content, t2.content)
+                    else:
+                        c1 = t1.content[:60]
+                        c2 = t2.content[:60]
+                        shared_lbl = set(t1.labels) & set(t2.labels)
+                        lbl_str = ", ".join(shared_lbl - {"__dream__", "__system__"}) if shared_lbl else "general"
+                        fused_content = "[concept:" + lbl_str + "] " + c1 + " intersect " + c2
+
+                    bridge = (t1.centroid + t2.centroid) / 2.0
+                    bridge += np.random.normal(0, 0.01, size=3)
+                    combined_labels = list(set(t1.labels + t2.labels) - {"__dream__", "__system__"})
+
+                    new_id = self.store(
+                        content=fused_content,
+                        seed_point=bridge,
+                        labels=combined_labels[:8],
+                        metadata={
+                            "type": "cross_fusion",
+                            "sources": [t1_id, t2_id],
+                            "fusion_score": score,
+                        },
+                        weight=min(t1.weight, t2.weight) * 0.8,
+                    )
+                    stats["cross_fusions"] += 1
+                    stats["themes_created"].append(new_id[:8])
+                    ops += 1
+
+        self._query_cache_dirty = True
+        return stats
 
     def catalyze_integration_batch(
         self, tetra_ids: List[str], strength: float = 1.0
@@ -493,6 +714,93 @@ class TetraMesh:
         weight_factor = tetra.weight / (tetra.init_weight + 1e-6)
         return geometric_dist * path_penalty * time_bonus / (weight_factor + 0.1)
 
+    def navigate_topology(
+        self, seed_id: str, max_steps: int = 30, strategy: str = "bfs"
+    ) -> List[Tuple[str, str, int]]:
+        """Pure topology navigation — no Euclidean distance used.
+
+        Returns list of (tetra_id, connection_type, hop_distance).
+        connection_type: 'face', 'edge', 'vertex'
+        hop_distance: number of hops from seed
+        """
+        with self._lock:
+            if seed_id not in self._tetrahedra:
+                return []
+
+            visited = {seed_id}
+            result = [(seed_id, "seed", 0)]
+            frontier_face = [(seed_id, 0)]
+            frontier_edge: List[Tuple[str, int]] = []
+            frontier_vertex: List[Tuple[str, int]] = []
+
+            for _ in range(max_steps):
+                next_frontier = []
+                for tid, hop in frontier_face:
+                    for nid in self._face_neighbors(tid):
+                        if nid not in visited and nid in self._tetrahedra:
+                            visited.add(nid)
+                            self._tetrahedra[nid].touch()
+                            result.append((nid, "face", hop + 1))
+                            next_frontier.append((nid, hop + 1))
+                    for nid in self._edge_neighbors(tid):
+                        if nid not in visited:
+                            frontier_edge.append((nid, hop + 1))
+                frontier_face = next_frontier
+
+                next_edge = []
+                for nid, hop in frontier_edge:
+                    if nid not in visited and nid in self._tetrahedra:
+                        visited.add(nid)
+                        self._tetrahedra[nid].touch()
+                        result.append((nid, "edge", hop))
+                        next_frontier.append((nid, hop))
+                    elif nid not in visited:
+                        next_edge.append((nid, hop))
+                frontier_face.extend(next_frontier)
+                frontier_edge = next_edge
+
+                if not frontier_face and not frontier_edge:
+                    break
+
+            for nid, hop in frontier_edge:
+                if nid not in visited and nid in self._tetrahedra:
+                    visited.add(nid)
+                    result.append((nid, "vertex", hop))
+
+            return result
+
+    def seed_by_label(self, labels: List[str]) -> Optional[str]:
+        """Pure topology seed — find tetra by label match, no geometry."""
+        best_id = None
+        best_overlap = 0
+        best_access = -1
+        for tid, tetra in self._tetrahedra.items():
+            overlap = len(set(tetra.labels) & set(labels))
+            if overlap > best_overlap or (overlap == best_overlap and tetra.access_count > best_access):
+                best_overlap = overlap
+                best_access = tetra.access_count
+                best_id = tid
+        return best_id
+
+    def seed_by_structure(self, query_labels: Optional[List[str]] = None) -> Optional[str]:
+        """Pure topology seed — pick highest-face-connectivity tetra.
+        No Euclidean distance. Uses structural importance."""
+        if query_labels:
+            labeled = self.seed_by_label(query_labels)
+            if labeled:
+                return labeled
+
+        best_id = None
+        best_score = -1.0
+        for tid, tetra in self._tetrahedra.items():
+            face_nb = len(self._face_neighbors(tid))
+            edge_nb = len(self._edge_neighbors(tid))
+            struct_score = face_nb * 3.0 + edge_nb * 1.0 + tetra.weight * 0.5
+            if struct_score > best_score:
+                best_score = struct_score
+                best_id = tid
+        return best_id
+
     def _add_vertex(self, point: np.ndarray) -> int:
         idx = len(self._vertices)
         self._vertices.append(point.copy())
@@ -538,7 +846,7 @@ class TetraMesh:
         return tuple(verts)
 
     def _attach_to_boundary(self, seed_point: np.ndarray) -> Tuple[int, int, int, int]:
-        if self._boundary_dirty:
+        if self._boundary_dirty and not self._boundary_face_keys:
             self._rebuild_boundary_cache()
 
         last_id = self._last_tetra_id
