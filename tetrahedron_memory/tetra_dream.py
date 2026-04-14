@@ -15,6 +15,9 @@ Core principles enforced:
   - All noise is transformed through integration, never removed
 """
 
+from collections import defaultdict
+from dataclasses import dataclass
+import hashlib
 import logging
 import random
 import threading
@@ -30,6 +33,193 @@ logger = logging.getLogger("tetramem.dream")
 
 DreamSynthesisInput = Dict[str, Any]
 DreamSynthesisFn = Callable[[List[DreamSynthesisInput]], Optional[str]]
+
+
+@dataclass
+class DreamRecord:
+    __slots__ = (
+        "dream_id",
+        "tetra_id",
+        "source_tetra_ids",
+        "source_clusters",
+        "synthesis_content",
+        "fusion_quality",
+        "entropy_before",
+        "entropy_after",
+        "entropy_delta",
+        "creation_time",
+        "labels",
+        "reintegrated",
+        "reintegration_count",
+        "walk_path_hash",
+    )
+
+    dream_id: str
+    tetra_id: str
+    source_tetra_ids: List[str]
+    source_clusters: List[List[str]]
+    synthesis_content: str
+    fusion_quality: float
+    entropy_before: float
+    entropy_after: float
+    entropy_delta: float
+    creation_time: float
+    labels: List[str]
+    reintegrated: bool
+    reintegration_count: int
+    walk_path_hash: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "dream_id": self.dream_id,
+            "tetra_id": self.tetra_id,
+            "source_tetra_ids": self.source_tetra_ids,
+            "source_clusters": self.source_clusters,
+            "synthesis_content": self.synthesis_content[:200],
+            "fusion_quality": self.fusion_quality,
+            "entropy_before": self.entropy_before,
+            "entropy_after": self.entropy_after,
+            "entropy_delta": self.entropy_delta,
+            "creation_time": self.creation_time,
+            "labels": self.labels,
+            "reintegrated": self.reintegrated,
+            "reintegration_count": self.reintegration_count,
+            "walk_path_hash": self.walk_path_hash,
+        }
+
+
+class DreamStore:
+    def __init__(self, max_records: int = 500):
+        self._records: Dict[str, DreamRecord] = {}
+        self._by_source: Dict[str, Set[str]] = defaultdict(set)
+        self._max_records = max_records
+        self._chronological: List[str] = []
+
+    def record(self, dream: DreamRecord) -> None:
+        self._records[dream.dream_id] = dream
+        self._chronological.append(dream.dream_id)
+        for sid in dream.source_tetra_ids:
+            self._by_source[sid].add(dream.dream_id)
+        if len(self._records) > self._max_records:
+            oldest_id = self._chronological.pop(0)
+            old = self._records.pop(oldest_id, None)
+            if old:
+                for sid in old.source_tetra_ids:
+                    self._by_source[sid].discard(oldest_id)
+
+    def get(self, dream_id: str) -> Optional[DreamRecord]:
+        return self._records.get(dream_id)
+
+    def get_by_source(self, tetra_id: str) -> List[DreamRecord]:
+        dream_ids = self._by_source.get(tetra_id, set())
+        return [self._records[did] for did in dream_ids if did in self._records]
+
+    def get_recent(self, n: int = 10) -> List[DreamRecord]:
+        ids = self._chronological[-n:]
+        return [self._records[did] for did in ids if did in self._records]
+
+    def mark_reintegrated(self, dream_id: str) -> None:
+        rec = self._records.get(dream_id)
+        if rec:
+            rec.reintegrated = True
+            rec.reintegration_count += 1
+
+    def quality_stats(self) -> Dict[str, Any]:
+        if not self._records:
+            return {"count": 0, "avg_quality": 0.0, "avg_entropy_delta": 0.0}
+        qualities = [r.fusion_quality for r in self._records.values()]
+        deltas = [r.entropy_delta for r in self._records.values()]
+        return {
+            "count": len(self._records),
+            "avg_quality": float(np.mean(qualities)),
+            "max_quality": float(max(qualities)),
+            "min_quality": float(min(qualities)),
+            "avg_entropy_delta": float(np.mean(deltas)),
+            "reintegrated_count": sum(1 for r in self._records.values() if r.reintegrated),
+        }
+
+    @property
+    def size(self) -> int:
+        return len(self._records)
+
+
+def fusion_quality_score(
+    source_inputs: List[DreamSynthesisInput],
+    synthesized_content: Optional[str],
+) -> float:
+    """Topology-aware fusion quality score (v2).
+
+    Scoring dimensions:
+      1. Source diversity (0-0.15) — number of distinct sources
+      2. Label diversity (0-0.10) — unique label spread
+      3. Weight balance (0-0.10) — how balanced source weights are
+      4. Content richness (0-0.15) — synthesis output length/quality
+      5. Topological connectivity (0-0.20) — shared faces/edges between sources
+      6. Source depth (0-0.15) — integration_count of sources (deeper = richer)
+      7. Centroid dispersion (0-0.15) — spatial spread indicates bridging value
+    """
+    if not synthesized_content or not source_inputs or len(source_inputs) < 2:
+        return 0.0
+
+    n_sources = len(source_inputs)
+
+    # 1. Source diversity
+    diversity_bonus = min(n_sources / 5.0, 1.0) * 0.15
+
+    # 2. Label diversity
+    all_labels = []
+    for inp in source_inputs:
+        all_labels.extend(inp.get("labels", []))
+    unique_labels = len(set(all_labels) - {"__dream__", "__system__"})
+    label_diversity = min(unique_labels / 8.0, 1.0) * 0.10
+
+    # 3. Weight balance
+    weight_range = [inp.get("weight", 1.0) for inp in source_inputs]
+    w_min, w_max = min(weight_range), max(weight_range)
+    weight_balance = 1.0 - min(abs(w_max - w_min) / max(w_max, 0.1), 1.0)
+    balance_score = weight_balance * 0.10
+
+    # 4. Content richness
+    content_len = len(synthesized_content)
+    if content_len < 10:
+        richness = 0.0
+    elif content_len < 50:
+        richness = 0.05
+    elif content_len < 200:
+        richness = 0.10
+    else:
+        richness = 0.15
+
+    # 5. Topological connectivity — shared labels as proxy for shared topology
+    label_sets = [set(inp.get("labels", [])) - {"__dream__", "__system__"} for inp in source_inputs]
+    shared_count = 0
+    pair_count = 0
+    for i in range(len(label_sets)):
+        for j in range(i + 1, len(label_sets)):
+            pair_count += 1
+            if label_sets[i] & label_sets[j]:
+                shared_count += 1
+    topo_connectivity = (shared_count / max(pair_count, 1)) * 0.20
+
+    # 6. Source depth — higher integration_count means deeper memories being fused
+    depths = [inp.get("integration_count", 0) for inp in source_inputs]
+    avg_depth = sum(depths) / len(depths)
+    depth_score = min(avg_depth / 10.0, 1.0) * 0.15
+
+    # 7. Centroid dispersion — spatially spread sources create more valuable bridges
+    centroids = [inp.get("centroid") for inp in source_inputs if inp.get("centroid")]
+    dispersion = 0.0
+    if len(centroids) >= 2:
+        centroid_arr = np.array(centroids)
+        pairwise_dists = []
+        for i in range(len(centroid_arr)):
+            for j in range(i + 1, len(centroid_arr)):
+                pairwise_dists.append(float(np.linalg.norm(centroid_arr[i] - centroid_arr[j])))
+        if pairwise_dists:
+            avg_dist = sum(pairwise_dists) / len(pairwise_dists)
+            dispersion = min(avg_dist / 2.0, 1.0) * 0.15
+
+    return min(1.0, diversity_bonus + label_diversity + balance_score + richness + topo_connectivity + depth_score + dispersion)
 
 
 def default_synthesis(contents: List[str], labels: List[List[str]]) -> Optional[str]:
@@ -68,6 +258,142 @@ def _build_synthesis_inputs(
             }
         )
     return inputs
+
+
+
+
+
+class DreamProtocol:
+    """Three-phase dream protocol: THINK -> EXECUTE -> REFLECT.
+
+    Per the TetraMem-XL v2.0 spec, dreams should follow a structured
+    cognition loop rather than blind synthesis:
+
+    THINK: Analyze sources, identify what should be synthesized
+    EXECUTE: Produce synthesis (LLM callback or default)
+    REFLECT: Evaluate quality, accept/reject, track outcome
+
+    This replaces ad-hoc synthesis_fn with a structured protocol.
+
+    Usage:
+        protocol = DreamProtocol(think_fn=my_analyzer, execute_fn=my_llm, reflect_fn=my_evaluator)
+        result = protocol.run(source_inputs)
+        if result.accepted:
+            mesh.store(result.content, ...)
+    """
+
+    def __init__(
+        self,
+        think_fn: Optional[Callable[[List[DreamSynthesisInput]], Optional[Dict[str, Any]]]] = None,
+        execute_fn: Optional[Callable[[List[DreamSynthesisInput], Optional[Dict[str, Any]]], Optional[str]]] = None,
+        reflect_fn: Optional[Callable[[str, List[DreamSynthesisInput]], float]] = None,
+        quality_threshold: float = 0.3,
+    ):
+        self._think_fn = think_fn
+        self._execute_fn = execute_fn
+        self._reflect_fn = reflect_fn or fusion_quality_score
+        self._quality_threshold = quality_threshold
+        self._history: List[Dict[str, Any]] = []
+        self._accepted = 0
+        self._rejected = 0
+
+    def run(self, source_inputs: List[DreamSynthesisInput]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "phase": "init",
+            "analysis": None,
+            "content": None,
+            "quality": 0.0,
+            "accepted": False,
+            "attempts": 0,
+        }
+
+        # Phase 1: THINK
+        result["phase"] = "think"
+        analysis = None
+        if self._think_fn is not None:
+            try:
+                analysis = self._think_fn(source_inputs)
+            except Exception:
+                analysis = None
+        if analysis is None:
+            analysis = self._default_think(source_inputs)
+        result["analysis"] = analysis
+
+        # Phase 2: EXECUTE
+        result["phase"] = "execute"
+        synthesized = None
+        if self._execute_fn is not None:
+            try:
+                synthesized = self._execute_fn(source_inputs, analysis)
+            except Exception:
+                synthesized = None
+        result["attempts"] = 1
+
+        if synthesized is None:
+            synthesized = self._default_execute(source_inputs, analysis)
+        result["content"] = synthesized
+
+        # Phase 3: REFLECT
+        result["phase"] = "reflect"
+        quality = self._reflect_fn(source_inputs, synthesized)
+        result["quality"] = quality
+        result["accepted"] = quality >= self._quality_threshold
+        result["phase"] = "complete"
+
+        if result["accepted"]:
+            self._accepted += 1
+        else:
+            self._rejected += 1
+        self._history.append({
+            "quality": quality,
+            "accepted": result["accepted"],
+            "source_count": len(source_inputs),
+            "content_preview": (synthesized or "")[:100],
+        })
+        if len(self._history) > 100:
+            self._history = self._history[-50:]
+
+        return result
+
+    def _default_think(self, inputs: List[DreamSynthesisInput]) -> Dict[str, Any]:
+        all_labels = set()
+        total_weight = 0.0
+        max_depth = 0
+        for inp in inputs:
+            all_labels.update(inp.get("labels", []))
+            total_weight += inp.get("weight", 1.0)
+            max_depth = max(max_depth, inp.get("integration_count", 0))
+        all_labels.discard("__dream__")
+        all_labels.discard("__system__")
+        return {
+            "label_inventory": sorted(all_labels),
+            "total_weight": total_weight,
+            "max_depth": max_depth,
+            "n_sources": len(inputs),
+            "strategy": "bridge" if len(all_labels) > 3 else ("deepen" if max_depth > 3 else "surface"),
+        }
+
+    def _default_execute(self, inputs: List[DreamSynthesisInput], analysis: Dict[str, Any]) -> Optional[str]:
+        if not inputs or len(inputs) < 2:
+            return None
+        strategy = analysis.get("strategy", "surface")
+        labels = analysis.get("label_inventory", [])
+        label_str = ", ".join(labels[:4]) if labels else "general"
+        primary = max(inputs, key=lambda x: x.get("weight", 1.0))
+        content = primary.get("content", "")[:80]
+        n = len(inputs)
+        return "[dream:" + strategy + ":" + label_str + "] " + content + " + " + str(n - 1) + " related"
+
+    def get_statistics(self) -> Dict[str, Any]:
+        if not self._history:
+            return {"accepted": 0, "rejected": 0, "acceptance_rate": 0.0}
+        return {
+            "accepted": self._accepted,
+            "rejected": self._rejected,
+            "acceptance_rate": self._accepted / max(len(self._history), 1),
+            "avg_quality": float(np.mean([h["quality"] for h in self._history])),
+            "total_cycles": len(self._history),
+        }
 
 
 class TetraDreamCycle:
@@ -135,6 +461,7 @@ class TetraDreamCycle:
         self._dreams_reintegrated = 0
         self._last_stats: Dict[str, Any] = {}
         self._entropy_tracker = EntropyTracker()
+        self._dream_store = DreamStore()
 
     def _wrap_legacy_fn(self, fn):
         def wrapper(inputs):
@@ -239,7 +566,15 @@ class TetraDreamCycle:
             "dreams_reintegrated": self._dreams_reintegrated,
             "last_stats": self._last_stats,
             "entropy": self._entropy_tracker.get_summary(),
+            "dream_store": self._dream_store.quality_stats(),
         }
+
+    def get_dream_store(self) -> DreamStore:
+        return self._dream_store
+
+    def get_dream_trace(self, tetra_id: str) -> List[Dict[str, Any]]:
+        records = self._dream_store.get_by_source(tetra_id)
+        return [r.to_dict() for r in records]
 
     def _loop(self) -> None:
         while not self._stop.wait(timeout=self.cycle_interval):
@@ -341,6 +676,17 @@ class TetraDreamCycle:
                 stats["entropy_delta"] = (stats["entropy_before"] - entropy_after) / stats[
                     "entropy_before"
                 ]
+                for did in created_ids:
+                    rec = self._dream_store.get(did[:16] + "0" * (16 - len(did[:16])))
+                    if rec is None:
+                        for r in self._dream_store._records.values():
+                            if r.tetra_id == did:
+                                rec = r
+                                break
+                    if rec is not None:
+                        rec.entropy_before = stats["entropy_before"]
+                        rec.entropy_after = entropy_after
+                        rec.entropy_delta = stats["entropy_delta"]
 
         if self._zigzag_tracker is not None:
             post_snapshot = self._zigzag_tracker.record_snapshot(self.mesh)
@@ -366,8 +712,10 @@ class TetraDreamCycle:
     def _random_walk(
         self, pool: Dict[str, Any], entropy_bias: bool = True
     ) -> Tuple[List[str], List[str]]:
-        seed_id = (
-            self._pick_entropy_weighted_seed(pool)
+        seed_id = self._pick_time_priority_seed(pool)
+        if seed_id is None:
+            seed_id = (
+                self._pick_entropy_weighted_seed(pool)
             if entropy_bias
             else random.choice(list(pool.keys()))
         )
@@ -401,6 +749,35 @@ class TetraDreamCycle:
             current = nid
 
         return visited, conn_types
+
+    def _pick_time_priority_seed(self, pool: Dict[str, Any]) -> Optional[str]:
+        """Seed selection prioritized by time law.
+
+        Memories with high filtration (old + rarely accessed) get
+        priority for integration. Time drives consolidation.
+        """
+        if not pool:
+            return None
+
+        time_lambda = self.mesh._time_lambda
+        scored = []
+        for tid, tetra in pool.items():
+            fil = tetra.filtration(time_lambda)
+            access_decay = 1.0 / (1.0 + tetra.access_count * 0.1)
+            time_priority = fil * access_decay
+            scored.append((time_priority, tid))
+
+        scored.sort(reverse=True)
+
+        top_n = min(5, len(scored))
+        total_priority = sum(s[0] for s in scored[:top_n])
+        if total_priority <= 0:
+            return None
+
+        weights = [s[0] for s in scored[:top_n]]
+        import random as _rng
+        idx = _rng.choices(range(top_n), weights=weights, k=1)[0]
+        return scored[idx][1]
 
     def _pick_entropy_weighted_seed(self, pool: Dict[str, Any]) -> str:
         candidates = list(pool.keys())
@@ -584,6 +961,13 @@ class TetraDreamCycle:
 
                 source_ids_a = [inp["tetra_id"] for inp in inputs_a if "tetra_id" in inp]
                 source_ids_b = [inp["tetra_id"] for inp in inputs_b if "tetra_id" in inp]
+                all_source_ids = source_ids_a + source_ids_b
+
+                quality = fusion_quality_score(all_inputs, synthesized)
+
+                walk_hash = hashlib.md5(
+                    ("_".join(group_a[:3] + group_b[:3])).encode()
+                ).hexdigest()[:8] if group_a and group_b else "empty"
 
                 tid = self.mesh.store(
                     content=synthesized,
@@ -593,11 +977,33 @@ class TetraDreamCycle:
                         "type": "dream",
                         "source_clusters": [source_ids_a[:3], source_ids_b[:3]],
                         "fusion_depth": len(all_inputs),
+                        "fusion_quality": quality,
                     },
                     weight=self.dream_weight,
                 )
+
+                dream_rec = DreamRecord(
+                    dream_id=hashlib.sha256(
+                        (tid + str(time.time())).encode()
+                    ).hexdigest()[:16],
+                    tetra_id=tid,
+                    source_tetra_ids=all_source_ids[:10],
+                    source_clusters=[source_ids_a[:3], source_ids_b[:3]],
+                    synthesis_content=synthesized,
+                    fusion_quality=quality,
+                    entropy_before=0.0,
+                    entropy_after=0.0,
+                    entropy_delta=0.0,
+                    creation_time=time.time(),
+                    labels=list(shared_labels),
+                    reintegrated=False,
+                    reintegration_count=0,
+                    walk_path_hash=walk_hash,
+                )
+                self._dream_store.record(dream_rec)
+
                 created_ids.append(tid)
-                logger.info("Dream tetra created: %s", tid[:8])
+                logger.info("Dream tetra created: %s (quality=%.2f)", tid[:8], quality)
 
         return created_ids
 
@@ -618,5 +1024,9 @@ class TetraDreamCycle:
                 tetra = self.mesh.get_tetrahedron(tid)
                 if tetra is not None:
                     tetra.catalyze_integration(strength=2.0)
+                    for rec in self._dream_store._records.values():
+                        if rec.tetra_id == tid:
+                            self._dream_store.mark_reintegrated(rec.dream_id)
+                            break
 
         return to_reintegrate
