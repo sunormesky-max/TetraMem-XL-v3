@@ -111,6 +111,44 @@ python demo_tetramem.py
 
 See [demo_tetramem.py](./demo_tetramem.py) for a full 8-section walkthrough.
 
+
+## Performance Benchmarks
+
+Tested on **1-core 2GB cloud server** with `TetraMesh` + `TetraDreamCycle`.
+
+### Write Throughput (50K scale)
+
+| Scale | Throughput | Heap | RSS |
+|-------|-----------|------|-----|
+| 10K | ~1,200 items/s | 48 MB | 157 MB |
+| 20K | ~1,195 items/s | 79 MB | 283 MB |
+| 30K | ~1,204 items/s | 109 MB | 419 MB |
+| 40K | ~1,181 items/s | 135 MB | 539 MB |
+| 50K | ~1,192 items/s | 167 MB | 716 MB |
+
+### Per-Operation Latency (GeoMemoryBody)
+
+| Scale | avg | p50 | p99 |
+|-------|-----|-----|-----|
+| 10K | 2.2 ms | 2.1 ms | 2.5 ms |
+| 20K | 2.2 ms | 2.1 ms | 2.3 ms |
+
+### Per-Operation Latency (TetraMesh)
+
+| Scale | avg |
+|-------|-----|
+| 10K | 0.8 ms |
+
+### Key Observations
+
+- **Write throughput flat** at ~1,200 items/s from 10K to 50K (zero degradation)
+- **Memory linear**: ~3.3 MB per 1K tetrahedra (heap), RSS manageable at 716 MB for 50K
+- **Latency stable**: GeoMemoryBody ~2.1 ms, TetraMesh ~0.8 ms, no growth with scale
+- **Dream cycle stable**: 10 dream cycles triggered during 50K test, no failures
+- **Bottleneck**: Dream cycle causes brief throughput dip in the following batch (GC pressure)
+
+Reproduce: `python scale_test_50k.py` (see repository root)
+
 ## Resources
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — detailed architecture, scoring system, eternal audit
