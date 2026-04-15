@@ -547,7 +547,7 @@ class TetraMeshRouter:
                 if other_bounds.contains(point):
                     ghost = GhostCell(
                         node_id=tid,
-                        source_bucket_id=other_bid,
+                        source_bucket_id=bid,
                         geometry=point.copy(),
                         weight=1.0,
                         content_hash=hashlib.sha256(content.encode()).hexdigest()[:16],

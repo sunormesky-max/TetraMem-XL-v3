@@ -187,3 +187,5 @@ final_merge_one_click.ps1
 ci/PHASE_*.md
 docs/PHASE_*.md
 docs/TetraMem-XL-Final-Merge-Design.md
+
+tetramem_data_v2/

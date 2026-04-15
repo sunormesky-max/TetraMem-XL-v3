@@ -72,7 +72,7 @@ class TetraSelfOrganizer:
             stats["entropy_before"] = entropy_before
 
         for iteration in range(self.max_iterations):
-            cycle_actions = self._run_one_cycle(stats)
+            cycle_actions, st = self._run_one_cycle(stats, st)
             stats["iterations"] = iteration + 1
             stats["total_actions"] += cycle_actions
 
@@ -86,7 +86,8 @@ class TetraSelfOrganizer:
                 stats["convergence_reason"] = "entropy_stable"
                 break
 
-        st = self.mesh.compute_ph()
+        if st is None:
+            st = self.mesh.compute_ph()
         if st is not None:
             entropy_after = compute_persistent_entropy(st)
             self._entropy_tracker.record(entropy_after)
@@ -99,12 +100,13 @@ class TetraSelfOrganizer:
         self._total_actions += stats["total_actions"]
         return stats
 
-    def _run_one_cycle(self, stats: Dict[str, Any]) -> int:
+    def _run_one_cycle(self, stats: Dict[str, Any], st=None) -> tuple:
         actions = 0
 
-        st = self.mesh.compute_ph()
         if st is None:
-            return 0
+            st = self.mesh.compute_ph()
+        if st is None:
+            return 0, None
 
         h2_intervals = st.persistence_intervals_in_dimension(2)
         h0_intervals = st.persistence_intervals_in_dimension(0)
@@ -123,7 +125,10 @@ class TetraSelfOrganizer:
         stats["integrations"] += integrate_count
         actions += integrate_count
 
-        return actions
+        if actions > 0:
+            st = None
+
+        return actions, st
 
     def _cave_growth(self, birth: float, death: float) -> int:
         import hashlib
@@ -132,12 +137,24 @@ class TetraSelfOrganizer:
         if len(tetrahedra) < 4:
             return 0
 
+        birth_midpoint = (birth + death) / 2.0
         centroid = np.zeros(3)
-        count = 0
+        total_weight = 0.0
         for t in tetrahedra.values():
-            centroid += t.centroid
-            count += 1
-        centroid /= count
+            if "__system__" in t.labels:
+                continue
+            w = abs(t._spatial_alpha - birth_midpoint)
+            weight = 1.0 / (w + 0.1)
+            centroid += t.centroid * weight
+            total_weight += weight
+        if total_weight > 0:
+            centroid /= total_weight
+        else:
+            count = 0
+            for t in tetrahedra.values():
+                centroid += t.centroid
+                count += 1
+            centroid /= count
 
         direction = centroid / (np.linalg.norm(centroid) + 1e-12)
         repulsion_point = centroid + direction * 0.5

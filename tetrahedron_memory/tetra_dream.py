@@ -446,13 +446,13 @@ class TetraDreamCycle:
         self._zigzag_tracker = zigzag_tracker
 
         if synthesis_fn is not None:
-            self.synthesis_fn = synthesis_fn
+            self._protocol = DreamProtocol(execute_fn=lambda inputs, _: synthesis_fn(inputs))
         elif legacy_compat_fn is not None:
             self._legacy_fn = legacy_compat_fn
-            self.synthesis_fn = self._wrap_legacy_fn(legacy_compat_fn)
+            wrapped = self._wrap_legacy_fn(legacy_compat_fn)
+            self._protocol = DreamProtocol(execute_fn=lambda inputs, _: wrapped(inputs))
         else:
-            self._legacy_fn = default_synthesis
-            self.synthesis_fn = self._default_deep_synthesis
+            self._protocol = DreamProtocol()
 
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -866,62 +866,6 @@ class TetraDreamCycle:
 
         return clusters
 
-    def _synthesize_and_insert(self, clusters: List[List[str]]) -> int:
-        created = 0
-        for i in range(len(clusters)):
-            for j in range(i + 1, len(clusters)):
-                group_a = clusters[i]
-                group_b = clusters[j]
-
-                inputs_a = _build_synthesis_inputs(self.mesh, group_a)
-                inputs_b = _build_synthesis_inputs(self.mesh, group_b)
-
-                if not inputs_a or not inputs_b:
-                    continue
-
-                all_inputs = inputs_a + inputs_b
-
-                synthesized = self.synthesis_fn(all_inputs)
-                if synthesized is None:
-                    continue
-
-                centroids_a = [np.array(inp["centroid"]) for inp in inputs_a if inp.get("centroid")]
-                centroids_b = [np.array(inp["centroid"]) for inp in inputs_b if inp.get("centroid")]
-
-                if centroids_a and centroids_b:
-                    bridge_point = (
-                        np.mean(centroids_a, axis=0) + np.mean(centroids_b, axis=0)
-                    ) / 2.0
-                    bridge_point += np.random.normal(0, 0.02, size=3)
-                else:
-                    bridge_point = np.random.randn(3)
-                    bridge_point /= np.linalg.norm(bridge_point) + 1e-12
-
-                shared_labels = set()
-                for inp in all_inputs:
-                    shared_labels.update(inp.get("labels", []))
-                shared_labels.discard("__dream__")
-                shared_labels.discard("__system__")
-
-                source_ids_a = [inp["tetra_id"] for inp in inputs_a if "tetra_id" in inp]
-                source_ids_b = [inp["tetra_id"] for inp in inputs_b if "tetra_id" in inp]
-
-                tid = self.mesh.store(
-                    content=synthesized,
-                    seed_point=bridge_point,
-                    labels=list(shared_labels) + ["__dream__"],
-                    metadata={
-                        "type": "dream",
-                        "source_clusters": [source_ids_a[:3], source_ids_b[:3]],
-                        "fusion_depth": len(all_inputs),
-                    },
-                    weight=self.dream_weight,
-                )
-                created += 1
-                logger.info("Dream tetra created: %s", tid[:8])
-
-        return created
-
     def _synthesize_and_insert_tracked(self, clusters: List[List[str]]) -> List[str]:
         created_ids = []
         for i in range(len(clusters)):
@@ -937,8 +881,9 @@ class TetraDreamCycle:
 
                 all_inputs = inputs_a + inputs_b
 
-                synthesized = self.synthesis_fn(all_inputs)
-                if synthesized is None:
+                protocol_result = self._protocol.run(all_inputs)
+                synthesized = protocol_result.get("content")
+                if synthesized is None or not protocol_result.get("accepted", False):
                     continue
 
                 centroids_a = [np.array(inp["centroid"]) for inp in inputs_a if inp.get("centroid")]
@@ -963,7 +908,7 @@ class TetraDreamCycle:
                 source_ids_b = [inp["tetra_id"] for inp in inputs_b if "tetra_id" in inp]
                 all_source_ids = source_ids_a + source_ids_b
 
-                quality = fusion_quality_score(all_inputs, synthesized)
+                quality = protocol_result.get("quality", 0.0)
 
                 walk_hash = hashlib.md5(
                     ("_".join(group_a[:3] + group_b[:3])).encode()

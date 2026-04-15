@@ -25,7 +25,18 @@ except ImportError:
     GUDHI_AVAILABLE = False
 
 
-@dataclass
+def text_to_geometry(text: str, labels = None) -> np.ndarray:
+    """Deterministic text-to-3D-point mapping using SHA-256 hash.
+    
+    Shared utility used by both TetraMesh API and core module
+    to ensure consistent spatial layout across all entry points.
+    """
+    h = hashlib.sha256(text.encode()).digest()
+    vals = np.frombuffer(h[:12], dtype=np.float32).copy()
+    vals = vals / (np.abs(vals).max() + 1e-8) * 3.0
+    return vals[:3]
+
+
 class MemoryTetrahedron:
     __slots__ = (
         "id",
@@ -221,6 +232,8 @@ class TetraMesh:
         self._query_cache_dirty = True
         self._vertex_ref_count: Dict[int, int] = defaultdict(int)
         self._vertex_compact_threshold = 256
+        self._hub_node_id: Optional[str] = None
+        self._hub_node_score: float = -1.0
 
     def store(
         self,
@@ -280,6 +293,7 @@ class TetraMesh:
                 self._boundary_dirty = True
                 self._inserts_since_boundary_rebuild = 0
             self._query_cache_dirty = True
+            self._hub_node_id = None
             return tetra_id
 
     def query_topological(self, query_point: np.ndarray, k: int = 5,
@@ -294,10 +308,11 @@ class TetraMesh:
           - Time score (freshness)
         """
         cache_key = f"{query_point.tobytes().hex()}_{k}_{tuple(labels or [])}"
-        if not self._query_cache_dirty and cache_key in self._query_cache:
-            return self._query_cache[cache_key]
 
         with self._lock:
+            if not self._query_cache_dirty and cache_key in self._query_cache:
+                return self._query_cache[cache_key]
+
             if not self._tetrahedra:
                 return []
 
@@ -790,6 +805,9 @@ class TetraMesh:
             if labeled:
                 return labeled
 
+        if self._hub_node_id is not None and self._hub_node_id in self._tetrahedra:
+            return self._hub_node_id
+
         best_id = None
         best_score = -1.0
         for tid, tetra in self._tetrahedra.items():
@@ -799,6 +817,8 @@ class TetraMesh:
             if struct_score > best_score:
                 best_score = struct_score
                 best_id = tid
+        self._hub_node_id = best_id
+        self._hub_node_score = best_score
         return best_id
 
     def _add_vertex(self, point: np.ndarray) -> int:
