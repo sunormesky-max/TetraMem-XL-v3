@@ -436,6 +436,7 @@ class TetraDreamCycle:
         dream_weight: float = 0.5,
         legacy_compat_fn: Optional[Callable] = None,
         zigzag_tracker: Optional[Any] = None,
+        llm_executor: Optional[Any] = None,
     ):
         self.mesh = mesh
         self.organizer = organizer
@@ -445,7 +446,14 @@ class TetraDreamCycle:
         self.dream_weight = dream_weight
         self._zigzag_tracker = zigzag_tracker
 
-        if synthesis_fn is not None:
+        if llm_executor is not None:
+            self._protocol = DreamProtocol(
+                think_fn=llm_executor.think,
+                execute_fn=llm_executor.execute,
+                reflect_fn=llm_executor.reflect,
+                quality_threshold=0.4,
+            )
+        elif synthesis_fn is not None:
             self._protocol = DreamProtocol(execute_fn=lambda inputs, _: synthesis_fn(inputs))
         elif legacy_compat_fn is not None:
             self._legacy_fn = legacy_compat_fn

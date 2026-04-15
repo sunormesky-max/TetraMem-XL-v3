@@ -11,7 +11,7 @@ def fresh_api(tmp_path, monkeypatch):
     import importlib
     import start_api_v2
     importlib.reload(start_api_v2)
-    start_api_v2.startup()
+    start_api_v2.init_state()
     yield start_api_v2
     start_api_v2._flush_save()
 
@@ -128,7 +128,7 @@ class TestStats:
     def test_health(self, fresh_api):
         resp = fresh_api.health()
         assert resp["status"] == "ok"
-        assert resp["version"] == "2.3.2"
+        assert resp["version"] == "2.4.0"
         assert resp["uptime_seconds"] >= 0
 
 
@@ -229,5 +229,5 @@ class TestPersistence:
         import importlib
         import start_api_v2
         importlib.reload(start_api_v2)
-        start_api_v2.startup()
+        start_api_v2.init_state()
         assert len(start_api_v2._mesh.tetrahedra) >= 1

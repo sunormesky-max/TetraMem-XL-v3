@@ -1,8 +1,9 @@
 """
-TetraMem-XL API v2.3.2 - TetraMesh + TetraDreamCycle Core
-P0 bug fixes + P1 perf + P2 thread-safety
+TetraMem-XL API v2.4 — TetraMesh + TetraDreamCycle Core
+P0 fixes + P1 perf + P2 thread-safety + LLM dream synthesis
 """
 import os, time, hashlib, threading, numpy as np
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -14,8 +15,6 @@ from tetrahedron_memory.tetra_self_org import TetraSelfOrganizer
 
 STORAGE_DIR = os.environ.get("TETRAMEM_STORAGE", "./tetramem_data_v2")
 
-app = FastAPI(title="TetraMem-XL v2", version="2.3.2")
-_start_time = time.time()
 _mesh: TetraMesh = None
 _dream: TetraDreamCycle = None
 _self_org: TetraSelfOrganizer = None
@@ -23,6 +22,61 @@ _state_lock = threading.RLock()
 _save_timer: threading.Timer = None
 _save_lock = threading.Lock()
 _dirty = False
+_start_time = time.time()
+
+
+def _init_llm_executor():
+    provider = os.environ.get("TETRAMEM_LLM_PROVIDER", "")
+    if not provider:
+        return None
+    try:
+        from tetrahedron_memory.llm_integration import create_executor
+        executor = create_executor(provider)
+        if executor:
+            print(f"[TetraMem v2] LLM dream executor: {provider}")
+        return executor
+    except Exception as e:
+        print(f"[TetraMem v2] LLM init failed: {e}, using default")
+        return None
+
+
+def init_state():
+    """Initialize global state. Called by lifespan or directly in tests."""
+    global _mesh, _dream, _self_org
+    Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+    _mesh = TetraMesh()
+
+    llm = _init_llm_executor()
+    _dream = TetraDreamCycle(_mesh, llm_executor=llm)
+    _self_org = TetraSelfOrganizer(_mesh)
+
+    index_file = Path(STORAGE_DIR) / "mesh_index.json"
+    if index_file.exists():
+        import json
+        data = json.loads(index_file.read_text())
+        for item in data.get("tetrahedra", []):
+            pt = np.array(item["centroid"])
+            _mesh.store(
+                content=item["content"],
+                seed_point=pt,
+                labels=item.get("labels", []),
+                weight=item.get("weight", 1.0),
+                metadata=item.get("metadata"),
+            )
+        print(f"[TetraMem v2] Loaded {len(_mesh.tetrahedra)} tetrahedra")
+    else:
+        print("[TetraMem v2] Fresh start")
+
+
+@asynccontextmanager
+async def lifespan(application):
+    init_state()
+    yield
+    _flush_save()
+    print("[TetraMem v2] Shutdown complete, data flushed")
+
+
+app = FastAPI(title="TetraMem-XL v2", version="2.4.0", lifespan=lifespan)
 
 
 class StoreReq(BaseModel):
@@ -64,31 +118,6 @@ class NavigateReq(BaseModel):
 
 class SeedByLabelReq(BaseModel):
     labels: List[str]
-
-
-@app.on_event("startup")
-def startup():
-    global _mesh, _dream, _self_org
-    Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
-    _mesh = TetraMesh()
-    _dream = TetraDreamCycle(_mesh)
-    _self_org = TetraSelfOrganizer(_mesh)
-    index_file = Path(STORAGE_DIR) / "mesh_index.json"
-    if index_file.exists():
-        import json
-        data = json.loads(index_file.read_text())
-        for item in data.get("tetrahedra", []):
-            pt = np.array(item["centroid"])
-            _mesh.store(
-                content=item["content"],
-                seed_point=pt,
-                labels=item.get("labels", []),
-                weight=item.get("weight", 1.0),
-                metadata=item.get("metadata"),
-            )
-        print(f"[TetraMem v2] Loaded {len(_mesh.tetrahedra)} tetrahedra")
-    else:
-        print("[TetraMem v2] Fresh start")
 
 
 def _do_save():
@@ -142,7 +171,7 @@ def _text_to_point(text: str) -> np.ndarray:
 def store(req: StoreReq):
     try:
         with _state_lock:
-            mesh, dream = _mesh, _dream
+            mesh = _mesh
         pt = _text_to_point(req.content)
         tid = mesh.store(
             content=req.content,
@@ -292,7 +321,7 @@ def stats():
 
 @app.get("/api/v1/health")
 def health():
-    return {"status": "ok", "version": "2.3.2", "uptime_seconds": time.time() - _start_time}
+    return {"status": "ok", "version": "2.4.0", "uptime_seconds": time.time() - _start_time}
 
 
 @app.post("/api/v1/export")
@@ -311,11 +340,6 @@ def export():
         text = "\n".join(lines)
         out_local = Path(STORAGE_DIR) / "tetramem_export.md"
         out_local.write_text(text, encoding="utf-8")
-        try:
-            out_oc = Path("/root/.openclaw/workspace/sunorm-space-memory/tetramem_export.md")
-            out_oc.write_text(text, encoding="utf-8")
-        except Exception:
-            pass
         return {"status": "ok", "path": str(out_local), "size": len(text)}
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -352,12 +376,6 @@ def topology_health():
         return {"result": mesh.get_statistics()}
     except Exception as e:
         raise HTTPException(500, str(e))
-
-
-@app.on_event("shutdown")
-def shutdown():
-    _flush_save()
-    print(f"[TetraMem v2] Shutdown complete, data flushed")
 
 
 if __name__ == "__main__":
